@@ -1,0 +1,23 @@
+[env:adafruit_feather_esp32_v2]
+platform = espressif32 @ ~6.6.0
+board = adafruit_feather_esp32_v2
+framework = arduino
+monitor_speed = 115200
+
+; (ixtiyoriy) PSRAM bo'lsa yoqishingiz mumkin
+; board_build.arduino.psram = enabled
+
+lib_deps =
+  bblanchon/ArduinoJson @ 6.21.3
+  witnessmenow/UniversalTelegramBot @ 1.3.0
+  adafruit/Adafruit BME680 Library @ 2.0.5
+  adafruit/Adafruit BusIO @ 1.16.1
+
+build_unflags = -O0
+build_flags =
+  -Os
+  -ffunction-sections
+  -fdata-sections
+  -DEI_CLASSIFIER_ALLOCATION_STATIC=0
+  -DEIDSP_QUANTIZE_FILTERBANK=1
+  -DEI_CLASSIFIER_TFLITE_ENABLE_ESP_NN=1

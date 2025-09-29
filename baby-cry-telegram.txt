@@ -1,0 +1,393 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <driver/i2s.h>
+#include <time.h>
+#include "esp_heap_caps.h"
+#include <Wire.h>
+#include <Adafruit_BME680.h>
+
+#include <chaqaloq_inferencing.h>  // Edge Impulse exported header
+
+/********* USER SETTINGS *********/
+#define WIFI_SSID     "Redmi"
+#define WIFI_PASSWORD "12345678"
+
+#define BOT_TOKEN    "8416972639:AAHcWwWNZQhYKC_sk3WTwIOi-Rsbzb8ZQW8"  // eski tokenni REVOKE qilib yangisini yozing!
+#define CHAT_ID       "6765793230"          // @userinfobot orqali oling
+
+// I2S pins (SPH0645 → ESP32)
+#define I2S_WS   15   // LRCLK/WS (agar muammo bo'lsa 25 ga o'tkazing)
+#define I2S_SCK  33   // BCLK     (muammo bo'lsa 26 ga o'tkazing)
+#define I2S_SD   13   // DOUT
+
+#define SAMPLE_RATE 16000
+#define TARGET_LABEL "cry"
+
+// Trigger siyosati
+#define P_THRESH_UP    0.80f
+#define P_THRESH_DOWN  0.60f
+#define N_CONSEC       2
+#define COOLDOWN_MS    12000
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 13
+#endif
+static bool bme_ok = false;
+
+
+/********* GLOBALS *********/
+// Telegram
+WiFiClientSecure tls;
+UniversalTelegramBot bot(BOT_TOKEN, tls);
+
+static uint32_t last_alert_ms = 0;
+static bool armed = true;
+static int consec_hits = 0;
+
+// I2S align autodetect
+static int g_use_right = -1;  // -1 unknown, 0 left, 1 right
+static int g_use_shift = -1;  // -1 unknown, else 8 or 14
+
+// HPF (DC/rumble) — simple 1st-order with coeff ~0.995
+static int32_t hpf_y = 0, hpf_x1 = 0;
+static inline int32_t hpf24(int32_t x) {
+  int32_t yn = (x - hpf_x1) + (int32_t)(0.995f * (float)hpf_y);
+  hpf_x1 = x; hpf_y = yn;
+  return yn;
+}
+
+// EI buffer (dynamic)
+static int16_t* audio_buf = nullptr;
+static size_t   audio_fill = 0;
+
+// BME680 (I2C)
+Adafruit_BME680 bme;      // I2C
+static uint32_t last_bme_ms = 0;
+
+struct BmeRead {
+  bool ok;
+  float tempC, hum, pres_hPa;
+  float gas_ohm;
+};
+
+static BmeRead lastBmeCached{false, 0, 0, 0, 0};
+
+/********* Wi-Fi / Telegram helpers *********/
+static void wifiConnectBlocking(uint32_t timeout_ms = 30000) {
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname("baby-cry");
+  Serial.printf("[WiFi] Connecting to \"%s\"", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeout_ms) {
+    Serial.print('.');
+    delay(250);
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[WiFi] Connected. IP=%s RSSI=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("[WiFi] FAILED (SSID/parol yoki 2.4GHz sozlamasini tekshiring).");
+  }
+}
+
+static void wifiEnsureConnected() {
+  static uint32_t last = 0;
+  if (millis() - last < 5000) return;
+  last = millis();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Reconnecting...");
+    WiFi.disconnect();
+    WiFi.reconnect();
+  }
+}
+
+static bool tgSendReliable(const String &msg) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[TG] FAIL: WiFi down");
+    return false;
+  }
+  // Sertifikat tekshiruvisiz (sodda yo'l)
+  tls.setInsecure();
+
+  bool ok = false;
+  for (int i = 0; i < 3; ++i) {
+    ok = bot.sendMessage(CHAT_ID, msg, "Markdown");
+    Serial.printf("[TG] try %d -> %s\n", i + 1, ok ? "OK" : "FAIL");
+    if (ok) break;
+    delay(700);
+  }
+  return ok;
+}
+
+/********* I2S init *********/
+static void i2sMicInit() {
+  i2s_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+  cfg.sample_rate = SAMPLE_RATE;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;   // SPH0645: 24-bit in 32-bit slot
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;   // interleaved R,L
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 8;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = false;
+  cfg.fixed_mclk = 0;
+
+  i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
+
+  i2s_pin_config_t pins; memset(&pins, 0, sizeof(pins));
+  pins.bck_io_num   = I2S_SCK;
+  pins.ws_io_num    = I2S_WS;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;
+  pins.data_in_num  = I2S_SD;
+
+  i2s_set_pin(I2S_NUM_0, &pins);
+  i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
+
+  Serial.println("[I2S] Initialized.");
+}
+
+/********* I2S → int16 PCM *********/
+static void fillAudioForEI() {
+  if (audio_fill >= EI_CLASSIFIER_RAW_SAMPLE_COUNT) return;
+
+  int32_t buf[1024];
+  size_t br = 0;
+  if (i2s_read(I2S_NUM_0, buf, sizeof(buf), &br, 50 / portTICK_PERIOD_MS) != ESP_OK) return;
+  int n = br / sizeof(int32_t);
+
+  for (int i = 0; i + 1 < n && audio_fill < EI_CLASSIFIER_RAW_SAMPLE_COUNT; i += 2) {
+    int32_t rawR = buf[i + 0];
+    int32_t rawL = buf[i + 1];
+
+    int32_t r24a = (rawR >> 8),  l24a = (rawL >> 8);
+    int32_t r24b = (rawR >> 14), l24b = (rawL >> 14);
+
+    // Fix: last term should be nz_r14 (typo in earlier snippet)
+    if (g_use_right < 0 || g_use_shift < 0) {
+      const bool nz_r8  = (r24a != 0);
+      const bool nz_l8  = (l24a != 0);
+      const bool nz_r14 = (r24b != 0);
+      const bool nz_l14 = (l24b != 0);
+      if (nz_l8 || nz_r8 || nz_l14 || nz_r14) {
+        if (nz_l8)      { g_use_right = 0; g_use_shift = 8;  }
+        else if (nz_r8) { g_use_right = 1; g_use_shift = 8;  }
+        else if (nz_l14){ g_use_right = 0; g_use_shift = 14; }
+        else            { g_use_right = 1; g_use_shift = 14; }
+        Serial.printf("[I2S] Detected channel=%s shift=%d\n",
+                      g_use_right ? "RIGHT" : "LEFT", g_use_shift);
+      }
+    }
+
+    const int32_t raw = (g_use_right > 0) ? rawR : rawL;
+    const int32_t s24 = (g_use_shift == 14) ? (raw >> 14) : (raw >> 8);
+
+    // HPF
+    const int32_t s = hpf24(s24);
+
+    // 24-bit -> 16-bit
+    const int16_t v = (int16_t)(s >> 8);
+    audio_buf[audio_fill++] = v;
+  }
+}
+
+/********* Edge Impulse callback *********/
+static int raw_get_data(size_t offset, size_t length, float *out_ptr) {
+  if ((offset + length) > EI_CLASSIFIER_RAW_SAMPLE_COUNT) return EIDSP_OUT_OF_BOUNDS;
+  for (size_t i = 0; i < length; i++) {
+    out_ptr[i] = (float)audio_buf[offset + i] / 32768.0f;
+  }
+  return EIDSP_OK;
+}
+
+/********* BME680 helpers *********/
+static BmeRead readBME680_blocking() {
+  BmeRead r{false, 0, 0, 0, 0};
+  if (!bme.beginReading()) return r;  // ~0ms, schedules conversion
+  if (!bme.endReading())   return r;  // ~150ms incl. gas heater
+  r.ok       = true;
+  r.tempC    = bme.temperature;
+  r.hum      = bme.humidity;
+  r.pres_hPa = bme.pressure / 100.0f;     // Pa → hPa
+  r.gas_ohm  = bme.gas_resistance;        // Ω
+  return r;
+}
+
+/********* Inference + decision *********/
+static void runEIAndMaybeAlert() {
+  if (audio_fill < EI_CLASSIFIER_RAW_SAMPLE_COUNT) return;
+
+  signal_t signal;
+  signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+  signal.get_data = &raw_get_data;
+
+  ei_impulse_result_t result = { 0 };
+  const bool debug = false;
+
+  EI_IMPULSE_ERROR ei_err = run_classifier(&signal, &result, debug);
+  if (ei_err != EI_IMPULSE_OK) {
+    Serial.printf("[EI] run_classifier error: %d\n", ei_err);
+    audio_fill = 0;
+    return;
+  }
+
+  float top_p = 0.0f;
+  const char* top_label = nullptr;
+
+  for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+    const float p = result.classification[ix].value;
+    const char* lab = result.classification[ix].label;
+    if (p > top_p) { top_p = p; top_label = lab; }
+  }
+  Serial.printf("[EI] top=%s p=%.2f armed=%d consec=%d\n",
+                top_label ? top_label : "(null)", top_p, (int)armed, consec_hits);
+
+  const bool is_target = (top_label && (String(top_label) == String(TARGET_LABEL)));
+  const uint32_t now = millis();
+
+  if (armed) {
+    if (is_target && top_p >= P_THRESH_UP) {
+      consec_hits++;
+      if (consec_hits >= N_CONSEC && (now - last_alert_ms) > COOLDOWN_MS) {
+        digitalWrite(LED_BUILTIN, HIGH); delay(60); digitalWrite(LED_BUILTIN, LOW);
+
+        // Build Telegram message (non-blocking BME: use last cached reading)
+        String msg = "👶🔊 *Chaqaloq yig'isi aniqlangan!*"
+                     "\nLabel: " + String(top_label) +
+                     "\nP=" + String(top_p, 2);
+
+        if (lastBmeCached.ok) {
+          msg += "\n\n*Havo*: " +
+                 String(lastBmeCached.tempC,1) + "°C, " +
+                 String(lastBmeCached.hum,0) + "% RH, " +
+                 String(lastBmeCached.pres_hPa,1) + " hPa" +
+                 "\nGaz: " + String((unsigned long)lastBmeCached.gas_ohm) + " Ω";
+        }
+
+        if (tgSendReliable(msg)) last_alert_ms = now;
+        armed = false;
+        consec_hits = 0;
+      }
+    } else {
+      consec_hits = 0;
+    }
+  } else {
+    if (!is_target || top_p <= P_THRESH_DOWN) {
+      armed = true;
+    }
+  }
+
+  audio_fill = 0; // next window
+}
+
+/********* Memory helper (log) *********/
+static void printMem() {
+  size_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  size_t free32 = heap_caps_get_free_size(MALLOC_CAP_32BIT);
+  #ifdef MALLOC_CAP_SPIRAM
+    size_t freeSP = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  #else
+    size_t freeSP = 0;
+  #endif
+  Serial.printf("[MEM] free8=%u  free32=%u  freeSPIRAM=%u\n",
+                (unsigned)free8, (unsigned)free32, (unsigned)freeSP);
+}
+
+/********* SETUP / LOOP *********/
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n[BOOT] EI TinyML Baby Cry (ESP32 + SPH0645 + BME680)");
+
+  if ((int)EI_CLASSIFIER_FREQUENCY != SAMPLE_RATE) {
+    Serial.printf("[WARN] Model freq=%d Hz, I2S freq=%d Hz — mos emas!\n",
+                  (int)EI_CLASSIFIER_FREQUENCY, SAMPLE_RATE);
+  }
+
+  // EI buffer malloc
+  size_t need_bytes = (size_t)EI_CLASSIFIER_RAW_SAMPLE_COUNT * sizeof(int16_t);
+  #ifdef MALLOC_CAP_SPIRAM
+    audio_buf = (int16_t*) heap_caps_malloc(need_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  #else
+    audio_buf = nullptr;
+  #endif
+  if (!audio_buf) audio_buf = (int16_t*) malloc(need_bytes);
+  if (!audio_buf) {
+    Serial.printf("[MEM] audio_buf malloc(%u) FAILED\n", (unsigned)need_bytes);
+    while (1) { delay(1000); }
+  }
+
+  printMem();
+
+  // Wi-Fi
+  wifiConnectBlocking(30000);
+
+  // I2S mic init
+  i2sMicInit();
+
+  // 🔹 I2C start (SDA=27, SCL=14)
+  Wire.begin(27, 14);
+
+  // 🔹 BME680 init (ikkala manzilni tekshirib ko‘ramiz)
+  Serial.print("[BME680] Init...");
+  bme_ok = bme.begin(0x76) || bme.begin(0x77);
+  if (!bme_ok) {
+    Serial.println(" FAIL (topilmadi). Ulash va I2C pinlarini tekshiring.");
+  } else {
+    Serial.println(" OK");
+    bme.setTemperatureOversampling(BME680_OS_8X);
+    bme.setHumidityOversampling(BME680_OS_2X);
+    bme.setPressureOversampling(BME680_OS_4X);
+    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+    bme.setGasHeater(320, 150); // 320°C, 150 ms
+  }
+
+  // Hello ping (Wi-Fi bo'lsa)
+  if (WiFi.status() == WL_CONNECTED) {
+    tgSendReliable("🟢 EI TinyML baby-cry monitor online.");
+  }
+}
+
+
+void loop() {
+  // Wi-Fi sog'ligini kuzat
+  wifiEnsureConnected();
+
+  // Audio + inference
+  fillAudioForEI();
+  if (audio_fill >= EI_CLASSIFIER_RAW_SAMPLE_COUNT) {
+    runEIAndMaybeAlert();
+  }
+
+  // BME680 — har ~5s o‘qib, keshga joylaymiz (bloklamaslik uchun alertda shuni ishlatamiz)
+  if (millis() - last_bme_ms > 5000) {
+    last_bme_ms = millis();
+    if (bme_ok) {
+      BmeRead r = readBME680_blocking();
+      if (r.ok) {
+        lastBmeCached = r;
+        Serial.printf("[BME680] T=%.2fC  RH=%.1f%%  P=%.1fhPa  Gas=%.0fΩ\n",
+                      r.tempC, r.hum, r.pres_hPa, r.gas_ohm);
+      } else {
+        Serial.println("[BME680] read FAIL");
+      }
+    }
+  }
+  
+
+  // Serial test
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == 't') tgSendReliable("🧪 Test message (EI).");
+  }
+}

@@ -1,0 +1,108 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// -------- WiFi --------
+static const char* WIFI_SSID = "Redmi";
+static const char* WIFI_PASS = "12345678";
+
+// -------- Firebase --------
+#define API_KEY        "AIzaSyC0tX6wX3HOnMME02lfko2U0craEu5w_Ng"
+#define DATABASE_URL   "https://esp32-test-2c0f1-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL     "esp32@iot.com"
+#define USER_PASSWORD  "esp32test123"
+
+// -------- Sensor pinlari --------
+static const int SOIL_PIN = 34;   // ADC (input-only)
+
+// Firebase obyektlari
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+unsigned long lastPub = 0;
+
+float readSoilPct() {
+  int raw = analogRead(SOIL_PIN);   // 0..4095
+  float pct = 100.0f * (4095 - raw) / 4095.0f;
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  return pct;
+}
+
+static void waitForWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint8_t tries = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (++tries > 60) { // 30s timeout
+      Serial.println("\nWiFi reconnect...");
+      WiFi.disconnect(true);
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      tries = 0;
+    }
+  }
+  Serial.printf("\nWiFi OK: %s  IP=%s\n", WIFI_SSID, WiFi.localIP().toString().c_str());
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // ADC sozlash
+  analogReadResolution(12);                    // 0..4095
+  analogSetPinAttenuation(SOIL_PIN, ADC_11db); // 0..3.3V
+
+  waitForWiFi();
+
+  // Firebase config
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+
+  // Ixtiyoriy log callback (token holatini ko‘rish uchun)
+  config.token_status_callback = tokenStatusCallback;
+
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&config, &auth);
+
+  Serial.println("Firebase begin called, waiting for token...");
+  unsigned long t0 = millis();
+  while (!Firebase.ready() && millis() - t0 < 8000) {
+    delay(200);
+  }
+  Serial.printf("Firebase ready: %s\n", Firebase.ready() ? "YES" : "NO (will retry in loop)");
+}
+
+void loop() {
+  if (Firebase.ready() && (millis() - lastPub > 3000)) {
+    lastPub = millis();
+
+    //float moisture = readSoilPct();
+    float moisture = 55.6;
+    const double lat = 41.312336;   // hozircha mock GPS
+    const double lon = 69.279556;
+    const unsigned long ts = millis() / 1000;
+
+    FirebaseJson json;
+    json.set("ts", (int)ts);
+    json.set("moisture", moisture);
+    json.set("lat", lat);
+    json.set("lon", lon);
+
+    const String path = "/readings/esp32-field1";
+
+    if (Firebase.RTDB.pushJSON(&fbdo, path.c_str(), &json)) {
+      Serial.printf("OK: %s\n", fbdo.dataPath().c_str());
+    } else {
+      Serial.printf("ERR: %s\n", fbdo.errorReason().c_str());
+    }
+  }
+}
